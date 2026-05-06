@@ -3,6 +3,7 @@ package mount
 import (
 	"context"
 	"fmt"
+	"os/exec"
 	"time"
 
 	"github.com/titusmd/vaultmount/internal/config"
@@ -93,6 +94,21 @@ func Run(ctx context.Context, cfg MachineConfig, events chan<- Event) {
 		}
 	}
 
+	// ── Idempotency guard ─────────────────────────────────────────────────────
+	// If the mount point is already in the mount table AND responsive, we are
+	// done. This prevents double-mounts when the launchd watchdog, vaultmount,
+	// or any other agent races to mount the same path.
+	if cfg.CheckMounted(cfg.Connection.MountPoint) {
+		if ProbeMountLive(cfg.Connection.MountPoint, 3) {
+			emit(StateMounted, fmt.Sprintf("already mounted at %s (idempotent)", cfg.Connection.MountPoint), 0)
+			return
+		}
+		// In mount table but unresponsive → stale mount; force-unmount before proceeding.
+		emit(StateDiagnosing, "stale mount detected — force-unmounting before retry", 0)
+		forceUnmount(cfg.Connection.MountPoint)
+		time.Sleep(500 * time.Millisecond)
+	}
+
 	emit(StateDiagnosing, "checking macFUSE driver", 0)
 
 	// Step 1: macFUSE check
@@ -162,6 +178,13 @@ func Run(ctx context.Context, cfg MachineConfig, events chan<- Event) {
 		// sshfs exited 0 but not in mount table → macFUSE driver failure
 		emit(StateFatalError, "sshfs exited 0 but mount not in table — macFUSE driver failure (reboot may fix)", attempt)
 		return
+	}
+}
+
+// forceUnmount tries diskutil then umount -f to clear a stale mount.
+func forceUnmount(mountPoint string) {
+	if err := exec.Command("diskutil", "unmount", "force", mountPoint).Run(); err != nil {
+		_ = exec.Command("umount", "-f", mountPoint).Run()
 	}
 }
 

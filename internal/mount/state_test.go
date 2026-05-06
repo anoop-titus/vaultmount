@@ -277,6 +277,90 @@ func TestStateMachine_ContextCancel(t *testing.T) {
 	}
 }
 
+// ── Idempotency guard ─────────────────────────────────────────────────────────
+
+func TestStateMachine_AlreadyMounted_SkipsAll(t *testing.T) {
+	diagCalled := false
+	mountCalled := false
+	cfg := MachineConfig{
+		Connection: baseConn(),
+		SSHFSBin:   "/bin/ls",
+		MaxRetries: 3,
+		RetryDelay: 0,
+		RunDiagMacFUSE: func() (MacFUSEStatus, string) {
+			diagCalled = true
+			return MacFUSEOK, "ok"
+		},
+		RunDiagVPS: func() (VPSStatus, string) { return VPSOk, "ok" },
+		RunMount:   func() error { mountCalled = true; return nil },
+		// Already mounted AND alive → idempotency guard fires immediately.
+		CheckMounted: func(mp string) bool { return true },
+	}
+
+	// Override ProbeMountLive by using a mount point that exists on disk.
+	// The real ProbeMountLive does os.ReadDir; use /tmp which always works.
+	cfg.Connection.MountPoint = "/tmp"
+
+	events := collect(t, cfg)
+	if lastState(events) != StateMounted {
+		t.Errorf("want StateMounted (idempotent), got %s", lastState(events))
+	}
+	if diagCalled {
+		t.Error("macFUSE diag must NOT run when already mounted")
+	}
+	if mountCalled {
+		t.Error("mount must NOT be attempted when already mounted")
+	}
+	if !containsSubstr(events[len(events)-1].Message, "idempotent") {
+		t.Errorf("message should mention idempotent, got: %q", events[len(events)-1].Message)
+	}
+}
+
+func TestStateMachine_StaleMountRecovered(t *testing.T) {
+	// Stale = in mount table but ProbeMountLive fails (unresponsive).
+	// State machine should force-unmount then proceed normally.
+	mountCalled := false
+	cfg := MachineConfig{
+		Connection: baseConn(),
+		SSHFSBin:   "/bin/ls",
+		MaxRetries: 3,
+		RetryDelay: 0,
+		RunDiagMacFUSE: func() (MacFUSEStatus, string) { return MacFUSEOK, "ok" },
+		RunDiagVPS:     func() (VPSStatus, string) { return VPSOk, "ok" },
+		RunMount:       func() error { mountCalled = true; return nil },
+		// In mount table = true, but ProbeMountLive uses a non-existent path → stale.
+		CheckMounted: func(mp string) bool { return true },
+	}
+	// MountPoint is /nonexistent → ProbeMountLive will fail → stale path.
+	cfg.Connection.MountPoint = "/nonexistent-mount-e2e-test"
+
+	events := collect(t, cfg)
+	// After stale-mount recovery it should proceed and either mount or
+	// hit fuse_fail (since /nonexistent isn't really mounted after force-unmount).
+	// Either way the stale path must have been attempted (mount was called).
+	if !mountCalled {
+		t.Error("mount should be attempted after stale mount recovery")
+	}
+	// Must not be stuck in an idempotent short-circuit
+	for _, e := range events {
+		if containsSubstr(e.Message, "idempotent") {
+			t.Error("stale mount should not short-circuit as idempotent")
+		}
+	}
+}
+
+func containsSubstr(s, sub string) bool {
+	return len(s) >= len(sub) && (s == sub || len(sub) == 0 ||
+		func() bool {
+			for i := 0; i <= len(s)-len(sub); i++ {
+				if s[i:i+len(sub)] == sub {
+					return true
+				}
+			}
+			return false
+		}())
+}
+
 // ── state string representations ─────────────────────────────────────────────
 
 func TestStateString(t *testing.T) {
